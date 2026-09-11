@@ -1,0 +1,58 @@
+name: Build Android App APK
+
+on:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Create Dummy Android Project Structure
+        run: |
+          mkdir -p app/src/main/java/com/global/chatroom
+          mkdir -p app/src/main/res/values
+          
+          # Creating a basic MainActivity.java for wrapper
+          echo 'package com.global.chatroom; import android.app.Activity; import android.os.Bundle; import android.webkit.WebView; import android.webkit.WebSettings; public class MainActivity extends Activity { @Override protected void onCreate(Bundle savedInstanceState) { super.onCreate(savedInstanceState); WebView webView = new WebView(this); WebSettings ws = webView.getSettings(); ws.setJavaScriptEnabled(true); webView.loadData("<html><body style=\"background:#111;color:#fff;text-align:center;padding-top:50px;\"><h2>Global Live Chat Room</h2><p>App Running Successfully!</p></body></html>", "text/html", "UTF-8"); setContentView(webView); } }' > app/src/main/java/com/global/chatroom/MainActivity.java
+          
+          # Copy AndroidManifest
+          cp AndroidManifest.xml app/src/main/AndroidManifest.xml
+
+          # Build APK using Gradle
+          echo "include ':app'" > settings.gradle
+          echo "rootProject.name='GlobalChat'" > build.gradle
+          echo "buildscript { repositories { google(); mavenCentral() } dependencies { classpath 'com.android.tools.build:gradle:7.4.2' } }" > build.gradle
+          
+          mkdir -p app
+          echo "apply plugin: 'com.android.application' android { compileSdkVersion 33 defaultConfig { applicationId 'com.global.chatroom' minSdk 21 targetSdk 33 versionCode 1 versionName '1.0' } }" > app/build.gradle
+
+      - name: Build APK with Gradle
+        run: |
+          chmod +x ./gradlew || true
+          # Using gradle build wrapper or default gradle
+          gradle wrapper
+          ./gradlew assembleDebug || gradle assembleDebug
+
+      - name: Find and Move APK
+        run: |
+          mkdir -p final_apk
+          find . -name "*.apk" -exec cp {} final_apk/ \;
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: GlobalLiveChat-App-APK
+          path: final_apk/
