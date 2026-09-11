@@ -1,0 +1,1717 @@
+require "import"
+import "android.app.*"
+import "android.os.*"
+import "android.widget.*"
+import "android.view.*"
+import "android.content.Context"
+import "android.content.ClipData"
+import "android.content.ClipboardManager"
+import "android.graphics.Typeface"
+import "android.content.Intent"
+import "android.net.Uri"
+import "android.media.MediaRecorder"
+import "android.media.MediaPlayer"
+import "android.util.Base64"
+import "android.provider.Settings"
+import "android.text.InputFilter"
+import "android.text.InputFilter$LengthFilter"
+import "android.text.InputType"
+import "java.lang.String"
+import "java.io.File"
+import "java.io.FileReader"
+import "java.io.FileWriter"
+import "java.io.BufferedReader"
+import "java.io.FileInputStream"
+import "java.io.FileOutputStream"
+import "org.json.JSONObject"
+
+math.randomseed(os.time())
+
+-- Device ID for Secure Login & Limits
+local android_id = Settings.Secure.getString(service.getContentResolver(), Settings.Secure.ANDROID_ID)
+
+-- Firebase URLs
+local db_url_chat = "https://mohammad-usman-23-default-rtdb.firebaseio.com/chat_room.json"
+local base_url_chat = "https://mohammad-usman-23-default-rtdb.firebaseio.com/chat_room/"
+local db_url_online = "https://mohammad-usman-23-default-rtdb.firebaseio.com/online_users.json"
+local base_url_online = "https://mohammad-usman-23-default-rtdb.firebaseio.com/online_users/"
+local db_url_profiles = "https://mohammad-usman-23-default-rtdb.firebaseio.com/users_profile.json"
+local base_url_profiles = "https://mohammad-usman-23-default-rtdb.firebaseio.com/users_profile/"
+local base_url_limits = "https://mohammad-usman-23-default-rtdb.firebaseio.com/voice_limits/"
+local base_url_private = "https://mohammad-usman-23-default-rtdb.firebaseio.com/private_chats/"
+local base_url_blocked = "https://mohammad-usman-23-default-rtdb.firebaseio.com/blocked_users/"
+local base_url_admin_pass = "https://mohammad-usman-23-default-rtdb.firebaseio.com/admin_settings/password.json"
+
+local temp_dir = "/storage/emulated/0/解说/Plugins/Global Live Chat/temp/"
+local clear_key_file = temp_dir .. "cleared_chat_key.txt" 
+local audio_record_file = temp_dir .. "voice_record.m4a"
+local audio_play_file = temp_dir .. "voice_play.m4a"
+
+local currentUsername = ""
+local currentProfileData = nil
+-- ADMIN NAME LOCKED (exact spelling confirmed by user) --
+local adminName = "Mohammad Usman"
+local ttsMuted = false
+local isChatActive = false
+local isPrivateChatActive = false
+local currentChatPartnerID = ""
+local currentChatPartnerName = ""
+local isFirstLoad = true 
+local isPrivateFirstLoad = true
+local replyingTo = ""
+local knownKeys = {}
+local itemKeys = {}
+local itemValues = {}
+local rawMessages = {}
+local currentOnlineUsersList = {}
+
+local EXPIRY_SECONDS = 86400 -- 24 hours
+local DELETE_WAIT_SECONDS = 604800 -- 7 days
+
+-- Audio Variables
+local mediaRecorder = nil
+local chatPlayer = nil
+local isRecording = false
+local recordLimitRunnable = nil
+
+-- Profile Setup Variables
+local currentProfileStep = 1
+local tempName = ""
+local tempLoc = ""
+local tempBio = ""
+
+-- Aapka WhatsApp Number
+local myWhatsAppNumber = "923261421100" 
+local myWhatsAppDisplay = "+92 326 1421100"
+
+local ui_handler = Handler(Looper.getMainLooper())
+local ui = {} -- UI table globally available at top
+
+local function runOnUiThread(action)
+    ui_handler.post(Runnable{run=action})
+end
+
+local dirFile = File(temp_dir)
+if not dirFile.exists() then dirFile.mkdirs() end
+
+-- ================= ADMIN NAME MATCH (trim + case-insensitive) =================
+local function isAdminName(name)
+    if not name then return false end
+    local trimmed = name:gsub("^%s+", ""):gsub("%s+$", "")
+    return trimmed:lower() == adminName:lower()
+end
+
+-- ================= TTS MUTE LOGIC =================
+local function tts(text)
+    if not ttsMuted then
+        service.speak(text)
+    end
+end
+
+-- ================= UTILS & HTTP =================
+local function saveClearedKey(key)
+    local fw = FileWriter(clear_key_file)
+    fw.write(key)
+    fw.close()
+end
+
+local function getClearedKey()
+    local f = File(clear_key_file)
+    if f.exists() then
+        local reader = BufferedReader(FileReader(f))
+        local key = reader.readLine()
+        reader.close()
+        return key or ""
+    end
+    return ""
+end
+
+local lastClearedKey = getClearedKey()
+
+local function getPrivateClearFile(roomKey)
+    return temp_dir .. "private_cleared_" .. roomKey .. ".txt"
+end
+
+local function savePrivateClearedKey(roomKey, key)
+    local fw = FileWriter(getPrivateClearFile(roomKey))
+    fw.write(key)
+    fw.close()
+end
+
+local function getPrivateClearedKey(roomKey)
+    local f = File(getPrivateClearFile(roomKey))
+    if f.exists() then
+        local reader = BufferedReader(FileReader(f))
+        local key = reader.readLine()
+        reader.close()
+        return key or ""
+    end
+    return ""
+end
+
+local currentPrivateClearedKey = ""
+
+local function readFileText(path)
+    local f = File(path)
+    if not f.exists() then return nil end
+    local reader = BufferedReader(FileReader(f))
+    local out = {}
+    local line = reader.readLine()
+    while line do table.insert(out, line) line = reader.readLine() end
+    reader.close()
+    return table.concat(out, "\n")
+end
+
+local function executeHttp(method, urlStr, payload, callback)
+    local reqId = tostring(os.time()) .. tostring(math.random(1000, 9999))
+    local statusFile = temp_dir .. reqId .. ".txt"
+    
+    thread(function(m_method, m_url, m_payload, m_file)
+        require "import"
+        import "java.net.URL"
+        import "java.io.FileWriter"
+        import "java.io.BufferedReader"
+        import "java.io.InputStreamReader"
+        local JavaString = luajava.bindClass("java.lang.String")
+        
+        local function writeResult(st, res)
+            local fw = FileWriter(m_file)
+            fw.write(st .. "\n" .. (res or ""))
+            fw.close()
+        end
+        
+        local ok, err = pcall(function()
+            local url = URL(m_url)
+            local conn = url.openConnection()
+            conn.setConnectTimeout(8000)
+            conn.setRequestMethod(m_method)
+            
+            if m_payload then
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setDoOutput(true)
+                local os = conn.getOutputStream()
+                os.write(JavaString(m_payload).getBytes("UTF-8"))
+                os.close()
+            end
+            
+            local code = conn.getResponseCode()
+            if code == 200 then
+                local stream = conn.getInputStream()
+                local reader = BufferedReader(InputStreamReader(stream))
+                local result = ""
+                local line = reader.readLine()
+                while line do result = result .. line line = reader.readLine() end
+                reader.close()
+                conn.disconnect()
+                writeResult("200", result)
+            else
+                conn.disconnect()
+                writeResult(tostring(code), "")
+            end
+        end)
+        if not ok then writeResult("error", "") end
+    end, method, urlStr, payload, statusFile)
+    
+    local function poll(tries)
+        tries = tries or 25
+        local f = File(statusFile)
+        if f.exists() then
+            local content = readFileText(statusFile)
+            f.delete()
+            local nl = content and content:find("\n")
+            local st = content
+            local res = ""
+            if nl then st = content:sub(1, nl - 1) res = content:sub(nl + 1) end
+            callback(st, res)
+        elseif tries <= 0 then
+            callback("timeout", "")
+        else
+            ui_handler.postDelayed(Runnable{run=function() poll(tries - 1) end}, 400)
+        end
+    end
+    poll()
+end
+
+-- ================= FIREBASE PROFILE, BLOCK & LIMITS =================
+local function checkIfBlocked(callback)
+    executeHttp("GET", base_url_blocked .. android_id .. ".json", nil, function(c, r)
+        if c == "200" and r == "true" then
+            callback(true)
+        else
+            callback(false)
+        end
+    end)
+end
+
+local fetchMyProfile
+fetchMyProfile = function(callback)
+    checkIfBlocked(function(blocked)
+        if blocked then
+            tts("You are blocked by admin.")
+            callback("blocked", nil)
+            return
+        end
+        executeHttp("GET", base_url_profiles .. android_id .. ".json", nil, function(c, r)
+            if c == "200" and r ~= "null" and r ~= "" then
+                local j = JSONObject(r)
+                local isPending = j.has("pendingDelete") and j.getBoolean("pendingDelete")
+                if isPending then
+                    local pts = j.has("pendingDeleteTimestamp") and j.getInt("pendingDeleteTimestamp") or 0
+                    local now = os.time()
+                    if now - pts >= DELETE_WAIT_SECONDS then
+                        executeHttp("DELETE", base_url_profiles .. android_id .. ".json", nil, function()
+                            callback("not_found", nil)
+                        end)
+                    else
+                        callback("pending_delete", j)
+                    end
+                else
+                    currentUsername = j.getString("name")
+                    currentProfileData = j
+                    callback("active", j)
+                end
+            else
+                callback("not_found", nil)
+            end
+        end)
+    end)
+end
+
+-- Check logic for Admin Button Visibility
+local function checkAdminVisibility(name)
+    runOnUiThread(function()
+        if name and isAdminName(name) then
+            ui.btnAdminPanel.setVisibility(View.VISIBLE)
+        else
+            ui.btnAdminPanel.setVisibility(View.GONE)
+        end
+    end)
+end
+
+local function isNameTaken(name, callback)
+    executeHttp("GET", db_url_profiles, nil, function(c, r)
+        local taken = false
+        if c == "200" and r ~= "null" and r ~= "" then
+            pcall(function()
+                local j = JSONObject(r)
+                local it = j.keys()
+                while it.hasNext() do
+                    local uid = it.next()
+                    if uid ~= android_id then
+                        local obj = j.getJSONObject(uid)
+                        local pending = obj.has("pendingDelete") and obj.getBoolean("pendingDelete")
+                        if not pending and obj.has("name") and obj.getString("name") == name then
+                            taken = true
+                        end
+                    end
+                end
+            end)
+        end
+        callback(taken)
+    end)
+end
+
+local function showLoginView()
+    ui.loginView.setVisibility(View.VISIBLE)
+    if currentUsername ~= "" then
+        checkAdminVisibility(currentUsername)
+    end
+end
+
+local function checkVoiceLimitFirebase(callback)
+    local today = os.date("%Y-%m-%d")
+    executeHttp("GET", base_url_limits .. android_id .. ".json", nil, function(c, r)
+        local count = 0
+        if c == "200" and r ~= "null" and r ~= "" then
+            local j = JSONObject(r)
+            local savedDate = j.has("date") and j.getString("date") or ""
+            if savedDate == today then
+                count = j.has("count") and j.getInt("count") or 0
+            end
+        end
+        callback(count)
+    end)
+end
+
+local function incrementVoiceLimitFirebase(currentCount, callback)
+    local obj = JSONObject()
+    obj.put("date", os.date("%Y-%m-%d"))
+    obj.put("count", currentCount + 1)
+    executeHttp("PUT", base_url_limits .. android_id .. ".json", obj.toString(), function(c, r)
+        if callback then callback() end
+    end)
+end
+
+local function encodeFileToBase64(path)
+    local ok, b64 = pcall(function()
+        local file = File(path)
+        local len = file.length()
+        local java_lang_reflect_Array = luajava.bindClass("java.lang.reflect.Array")
+        local java_lang_Byte = luajava.bindClass("java.lang.Byte")
+        local buffer = java_lang_reflect_Array.newInstance(java_lang_Byte.TYPE, len)
+        local fis = FileInputStream(file)
+        fis.read(buffer)
+        fis.close()
+        return Base64.encodeToString(buffer, Base64.NO_WRAP)
+    end)
+    if ok then return b64 else return "" end
+end
+
+local function getPrivateChatKey(id1, id2)
+    if id1 < id2 then
+        return id1 .. "_" .. id2
+    else
+        return id2 .. "_" .. id1
+    end
+end
+
+-- ================= LAYOUT =================
+local main_layout = {
+    FrameLayout; layout_width="fill"; layout_height="fill";
+    { RelativeLayout; id="loginView"; layout_width="fill"; layout_height="fill";
+        { LinearLayout; id="loginBottom"; orientation="vertical"; layout_width="fill"; layout_alignParentBottom="true"; padding="10dp";
+            { Button; id="btnOpenProfile"; text="Profile"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnJoin"; text="Online Chat Room"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnPrivateRoomsList"; text="Private Chat Room"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnAdminPanel"; text="Admin Panel"; layout_width="fill"; layout_marginBottom="5dp"; visibility=View.GONE };
+            { Button; id="btnAbout"; text="Settings"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnCloseApp1"; text="Close Extension"; layout_width="fill" };
+        };
+        { LinearLayout; layout_width="fill"; layout_height="fill"; layout_above="loginBottom"; gravity="center";
+            { TextView; text="Global Live Chat Room"; textSize="24sp"; textColor="#000000"; };
+        };
+    };
+    { RelativeLayout; id="profileSetupView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; id="profileSetupBottom"; orientation="vertical"; layout_width="fill"; layout_alignParentBottom="true"; padding="10dp";
+            { Button; id="btnProfileSaveStep"; text="Save & Next"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnProfileCancel"; text="Go Back"; layout_width="fill" };
+        };
+        { LinearLayout; orientation="vertical"; layout_width="fill"; layout_height="fill"; layout_above="profileSetupBottom"; gravity="center_vertical"; padding="20dp";
+            { TextView; id="tvProfileStepHeader"; text="Setup Profile"; textSize="24sp"; textColor="#000000"; gravity="center"; layout_marginBottom="20dp" };
+            { EditText; id="inputProfileData"; hint="Likhein..."; layout_width="fill"; textSize="18sp"; singleLine=true };
+        };
+    };
+    { RelativeLayout; id="profileShowView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; id="profileShowBottom"; orientation="vertical"; layout_width="fill"; layout_alignParentBottom="true"; padding="5dp";
+            { LinearLayout; orientation="horizontal"; layout_width="fill";
+                { Button; id="btnEditProfile"; text="Edit Profile (7 Days Rule)"; layout_weight="1" };
+                { Button; id="btnBackFromProfileView"; text="Go Back"; layout_weight="1" };
+            };
+            { Button; id="btnDeleteProfile"; text="Delete Profile"; layout_width="fill"; layout_marginTop="5dp"; backgroundColor="#d32f2f"; textColor="#ffffff" };
+        };
+        { LinearLayout; orientation="vertical"; layout_width="fill"; layout_height="fill"; layout_above="profileShowBottom"; padding="20dp"; gravity="center_vertical";
+            { TextView; text="Your Profile"; textSize="24sp"; textColor="#000000"; gravity="center"; layout_marginBottom="20dp" };
+            { TextView; id="tvShowName"; textSize="18sp"; textColor="#333333"; layout_marginBottom="10dp" };
+            { TextView; id="tvShowLoc"; textSize="18sp"; textColor="#333333"; layout_marginBottom="10dp" };
+            { TextView; id="tvShowBio"; textSize="18sp"; textColor="#333333"; layout_marginBottom="10dp" };
+        };
+    };
+    { RelativeLayout; id="settingsMenuView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; orientation="vertical"; layout_width="fill"; layout_height="fill"; gravity="center"; padding="20dp";
+            { TextView; text="Settings"; textSize="24sp"; textColor="#000000"; gravity="center"; layout_marginBottom="20dp" };
+            { Button; id="btnGoToAboutSupport"; text="About & Support"; layout_width="fill"; layout_marginBottom="10dp" };
+            { Button; id="btnBackSettings"; text="Back"; layout_width="fill" };
+        };
+    };
+    { RelativeLayout; id="aboutView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; id="aboutBottom"; orientation="vertical"; layout_width="fill"; layout_alignParentBottom="true"; padding="10dp";
+            { Button; id="btnBackAbout"; text="Go Back"; layout_width="fill" };
+        };
+        { LinearLayout; orientation="vertical"; layout_width="fill"; layout_height="fill"; layout_above="aboutBottom"; gravity="center"; padding="20dp";
+            { TextView; text="Settings & About - Creator: Mohammad Usman"; textSize="18sp"; textColor="#000000"; gravity="center"; layout_marginBottom="20dp" };
+            { TextView; id="tvWaDisplay"; text="WhatsApp: " .. myWhatsAppDisplay; textSize="16sp"; textColor="#333333"; layout_marginBottom="20dp" };
+            { Button; id="btnCopyWa"; text="Copy WhatsApp Number"; layout_width="fill"; layout_marginBottom="10dp" };
+            { Button; id="btnContactWa"; text="Contact WhatsApp"; layout_width="fill" };
+        };
+    };
+    { RelativeLayout; id="chatView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; id="chatBottom"; orientation="vertical"; layout_width="fill"; layout_alignParentBottom="true"; backgroundColor="#eeeeee"; padding="2dp";
+            { TextView; id="replyText"; text=""; textColor="#d32f2f"; textSize="14sp"; padding="2dp"; visibility=View.GONE; };
+            { LinearLayout; id="normalChatBar"; orientation="horizontal"; layout_width="fill"; gravity="center_vertical";
+                { EditText; id="inputMessage"; hint="Message..."; layout_weight="1"; textSize="14sp"; singleLine=true };
+                { Button; id="btnMic"; text="Mic"; textSize="12sp"; padding="5dp" };
+                { Button; id="btnSend"; text="Send"; textSize="12sp"; padding="5dp" };
+                { Button; id="btnMore"; text="More"; textSize="12sp"; padding="5dp" };
+                { Button; id="btnBack"; text="Back"; textSize="12sp"; padding="5dp" };
+            };
+            { LinearLayout; id="audioPreviewBar"; orientation="horizontal"; layout_width="fill"; gravity="center_vertical"; visibility=View.GONE;
+                { TextView; id="tvAudioStatus"; text="🎙️ Audio Recorded"; layout_weight="1"; textSize="14sp"; padding="5dp"; textColor="#000000" };
+                { Button; id="btnPlayPreview"; text="Play"; textSize="12sp"; padding="5dp" };
+                { Button; id="btnSendAudio"; text="Send"; textSize="12sp"; padding="5dp" };
+                { Button; id="btnCancelAudio"; text="Cancel"; textSize="12sp"; padding="5dp" };
+            };
+        };
+        { ListView; id="chatList"; layout_width="fill"; layout_height="fill"; layout_above="chatBottom"; layout_alignParentTop="true"; };
+    };
+    { RelativeLayout; id="privateChatView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; id="privateChatBottom"; orientation="vertical"; layout_width="fill"; layout_alignParentBottom="true"; backgroundColor="#eeeeee"; padding="2dp";
+            { LinearLayout; id="privateChatBar"; orientation="horizontal"; layout_width="fill"; gravity="center_vertical";
+                { EditText; id="inputPrivateMessage"; hint="Private Message..."; layout_weight="1"; textSize="14sp"; singleLine=true };
+                { Button; id="btnPrivateSend"; text="Send"; textSize="12sp"; padding="5dp" };
+                { Button; id="btnPrivateClear"; text="Clear"; textSize="12sp"; padding="5dp" };
+                { Button; id="btnPrivateBack"; text="Back"; textSize="12sp"; padding="5dp" };
+            };
+        };
+        { ListView; id="privateChatList"; layout_width="fill"; layout_height="fill"; layout_above="privateChatBottom"; layout_alignParentTop="true"; };
+    };
+    { RelativeLayout; id="moreMenuView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; id="moreBottom"; orientation="vertical"; layout_width="fill"; layout_alignParentBottom="true"; padding="15dp"; backgroundColor="#e0e0e0"; 
+            { TextView; text="More Options"; textSize="18sp"; textColor="#000000"; gravity="center"; layout_marginBottom="10dp" };
+            { Button; id="btnClear"; text="Clear Chat"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnMute"; text="Mute/Unmute TTS"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnOnline"; text="Online Users"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnBackFromMore"; text="Go Back"; layout_width="fill" };
+        };
+    };
+    { RelativeLayout; id="onlineView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; id="onlineBottom"; layout_width="fill"; layout_alignParentBottom="true"; padding="10dp";
+            { Button; id="btnBackOnline"; text="Go Back"; layout_width="fill" };
+        };
+        { TextView; id="tvOnlineHeader"; text="Total Online Users: Loading..."; textSize="18sp"; textColor="#000000"; layout_width="fill"; layout_alignParentTop="true"; padding="15dp"; gravity="center"; };
+        { ListView; id="onlineList"; layout_width="fill"; layout_height="fill"; layout_below="tvOnlineHeader"; layout_above="onlineBottom"; };
+    };
+    { RelativeLayout; id="otherProfileView"; layout_width="fill"; layout_height="fill"; visibility=View.GONE;
+        { LinearLayout; id="otherProfileBottom"; orientation="vertical"; layout_width="fill"; layout_alignParentBottom="true"; padding="10dp";
+            { Button; id="btnStartPrivateChat"; text="Private Chat"; layout_width="fill"; layout_marginBottom="5dp" };
+            { Button; id="btnBlockUser"; text="Block User (Admin)"; layout_width="fill"; layout_marginBottom="5dp"; visibility=View.GONE };
+            { Button; id="btnBackFromOtherProfile"; text="Go Back"; layout_width="fill" };
+        };
+        { LinearLayout; orientation="vertical"; layout_width="fill"; layout_height="fill"; layout_above="otherProfileBottom"; padding="20dp"; gravity="center_vertical";
+            { TextView; id="tvOtherName"; textSize="20sp"; textColor="#000000"; layout_marginBottom="10dp" };
+            { TextView; id="tvOtherLoc"; textSize="18sp"; textColor="#333333"; layout_marginBottom="10dp" };
+            { TextView; id="tvOtherBio"; textSize="18sp"; textColor="#333333"; layout_marginBottom="10dp" };
+        };
+    };
+}
+
+local view = loadlayout(main_layout, ui)
+local dialog = AlertDialog.Builder(service)
+dialog.setView(view)
+dialog.setCancelable(false)
+local alert = dialog.create()
+
+alert.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+alert.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+alert.show()
+
+-- Background Auto-Check for Admin on Startup
+fetchMyProfile(function(status, data)
+    if status == "active" and data then
+        local n = data.getString("name")
+        checkAdminVisibility(n)
+    end
+end)
+
+-- ================= LOGIC =================
+local function beepAndVibrate()
+    pcall(function()
+        require "import"
+        import "android.media.RingtoneManager"
+        local uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+        local ringtone = RingtoneManager.getRingtone(service, uri)
+        if ringtone then ringtone.play() end
+    end)
+end
+
+local function stopAnyPlayingAudio()
+    pcall(function()
+        if chatPlayer then 
+            chatPlayer.stop() 
+            chatPlayer.release() 
+            chatPlayer = nil 
+        end
+    end)
+end
+
+-- Public Chat Messages Loader with Admin Tag + 24hr Auto Expiry
+local function loadMessages()
+    if not isChatActive then return end
+    executeHttp("GET", db_url_chat, nil, function(code, res)
+        if not isChatActive then return end
+        if code == "200" and res ~= "null" and res ~= "" then
+            pcall(function()
+                local json = JSONObject(res)
+                local keys = {}
+                local iter = json.keys()
+                while iter.hasNext() do table.insert(keys, iter.next()) end
+                table.sort(keys)
+                
+                local newValues = {}
+                local tempKeys = {}
+                local hasNewIncomingMsg = false
+                local justScroll = false
+                local latestSpeak = ""
+                local amIMentioned = false
+                local validMsgCount = 0 
+                local now = os.time()
+                
+                for i, k in ipairs(keys) do
+                    local obj = json.getJSONObject(k)
+                    local ts = obj.has("timestamp") and obj.getInt("timestamp") or 0
+                    
+                    if ts > 0 and (now - ts) > EXPIRY_SECONDS then
+                        executeHttp("DELETE", base_url_chat .. k .. ".json", nil, function() end)
+                    elseif lastClearedKey == "" or k > lastClearedKey then
+                        validMsgCount = validMsgCount + 1
+                        local senderID = obj.has("sender_id") and obj.getString("sender_id") or ""
+                        local senderName = obj.getString("sender")
+                        local text = obj.getString("text")
+                        local rep = obj.has("replyTo") and obj.getString("replyTo") or ""
+                        local tme = obj.has("time") and obj.getString("time") or ""
+                        local audB64 = obj.has("audioBase64") and obj.getString("audioBase64") or ""
+                        
+                        rawMessages[k] = {sender_id=senderID, senderName=senderName, text=text, replyTo=rep, time=tme, audioBase64=audB64}
+                        
+                        local dispName = senderName
+                        if isAdminName(senderName) then 
+                            dispName = "[Admin 🧑‍💻] " .. senderName 
+                        end
+                        
+                        local displayStr = dispName .. ": "
+                        if rep ~= "" then displayStr = displayStr .. "[Replying to " .. rep .. "] " end
+                        if audB64 ~= "" then displayStr = displayStr .. "🎙️ [Voice Message]" else displayStr = displayStr .. text end
+                        displayStr = displayStr .. " (" .. tme .. ")"
+                        
+                        if senderID == android_id then
+                            displayStr = displayStr .. " [Sent]"
+                        else
+                            displayStr = displayStr .. " [Received]"
+                        end
+                        
+                        table.insert(newValues, displayStr)
+                        table.insert(tempKeys, k)
+                        
+                        if not knownKeys[k] then
+                            knownKeys[k] = true
+                            if senderID == android_id then
+                                justScroll = true
+                            else
+                                hasNewIncomingMsg = true
+                                if audB64 ~= "" then 
+                                    latestSpeak = dispName .. " ka voice message aaya hai." 
+                                else 
+                                    latestSpeak = dispName .. " ka message: " .. text 
+                                end
+                                if text:find("@" .. currentUsername) then 
+                                    amIMentioned = true 
+                                    latestSpeak = dispName .. " ne aapko mention kiya hai."
+                                end
+                            end
+                        end
+                    else 
+                        knownKeys[k] = true 
+                    end
+                end
+                
+                itemKeys = tempKeys
+                itemValues = newValues
+                ui.chatList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String(itemValues)))
+                
+                if isFirstLoad then
+                    if validMsgCount > 0 then 
+                        tts("Online Chat Room loaded. " .. validMsgCount .. " messages available.") 
+                    else
+                        tts("Online Chat Room loaded. Koi message nahi hai.")
+                    end
+                    isFirstLoad = false
+                elseif hasNewIncomingMsg then
+                    beepAndVibrate()
+                    tts(latestSpeak)
+                    ui.chatList.setSelection(#itemValues - 1)
+                elseif justScroll then
+                    ui.chatList.setSelection(#itemValues - 1)
+                end
+            end)
+        end
+    end)
+end
+
+local function startAutoRefresh()
+    if not isChatActive then return end
+    local heartObj = JSONObject()
+    heartObj.put("lastActive", os.time())
+    executeHttp("PUT", base_url_online .. android_id .. ".json", heartObj.toString(), function() end)
+    loadMessages()
+    ui_handler.postDelayed(Runnable{run=startAutoRefresh}, 5000)
+end
+
+-- ================= PRIVATE CHAT SYSTEM =================
+local privateItemKeys = {}
+local privateItemValues = {}
+local privateRawMessages = {}
+local isPrivateActive = false
+
+local function loadPrivateMessages()
+    if not isPrivateActive then return end
+    local chatRoomKey = getPrivateChatKey(android_id, currentChatPartnerID)
+    local private_url = base_url_private .. chatRoomKey .. ".json"
+    
+    executeHttp("GET", private_url, nil, function(code, res)
+        if not isPrivateActive then return end
+        local newValues = {}
+        local tempKeys = {}
+        
+        if code == "200" and res ~= "null" and res ~= "" then
+            pcall(function()
+                local json = JSONObject(res)
+                local keys = {}
+                local iter = json.keys()
+                while iter.hasNext() do table.insert(keys, iter.next()) end
+                table.sort(keys)
+                
+                local now = os.time()
+                for i, k in ipairs(keys) do
+                    local obj = json.getJSONObject(k)
+                    local ts = obj.has("timestamp") and obj.getInt("timestamp") or 0
+                    
+                    if ts > 0 and (now - ts) > EXPIRY_SECONDS then
+                        executeHttp("DELETE", base_url_private .. chatRoomKey .. "/" .. k .. ".json", nil, function() end)
+                    elseif currentPrivateClearedKey == "" or k > currentPrivateClearedKey then
+                        local sID = obj.getString("sender_id")
+                        local sName = obj.getString("sender")
+                        local text = obj.getString("text")
+                        local tme = obj.getString("time")
+                        
+                        privateRawMessages[k] = {sender_id=sID, sender=sName, text=text, time=tme}
+                        
+                        local dispName = sName
+                        if isAdminName(sName) then dispName = "[Admin 🧑‍💻] " .. sName end
+                        
+                        local disp = dispName .. ": " .. text .. " (" .. tme .. ")"
+                        if sID == android_id then disp = disp .. " [Sent]" else disp = disp .. " [Received]" end
+                        
+                        table.insert(newValues, disp)
+                        table.insert(tempKeys, k)
+                    end
+                end
+            end)
+        end
+        
+        privateItemKeys = tempKeys
+        privateItemValues = newValues
+        ui.privateChatList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String(privateItemValues)))
+        if #privateItemValues > 0 then
+            ui.privateChatList.setSelection(#privateItemValues - 1)
+        end
+        
+        if isPrivateFirstLoad then
+            if #privateItemValues == 0 then
+                tts("Koi message nahi hai.")
+            else
+                tts(#privateItemValues .. " messages available hain.")
+            end
+            isPrivateFirstLoad = false
+        end
+    end)
+end
+
+local function startPrivateAutoRefresh()
+    if not isPrivateActive then return end
+    loadPrivateMessages()
+    ui_handler.postDelayed(Runnable{run=startPrivateAutoRefresh}, 5000)
+end
+
+ui.btnOpenProfile.onClick = function()
+    tts("Checking profile...")
+    fetchMyProfile(function(status, data)
+        if status == "blocked" then
+            return
+        elseif status == "pending_delete" then
+            local pts = data.has("pendingDeleteTimestamp") and data.getInt("pendingDeleteTimestamp") or 0
+            local daysLeft = 7 - math.floor((os.time() - pts) / 86400)
+            if daysLeft < 0 then daysLeft = 0 end
+            tts("Aapki profile delete process mein hai. " .. daysLeft .. " din baad naya profile bana sakte hain.")
+        elseif status == "not_found" then
+            currentProfileStep = 1 
+            tempName, tempLoc, tempBio = "", "", ""
+            ui.loginView.setVisibility(View.GONE) 
+            ui.profileSetupView.setVisibility(View.VISIBLE)
+            ui.tvProfileStepHeader.setText("Step 1: Name") 
+            ui.inputProfileData.setText("") 
+            ui.inputProfileData.setHint("Apna naam likhein...") 
+            ui.inputProfileData.setFilters({InputFilter.LengthFilter(50)})
+            tts("Apna name likhein. Aap zyada se zyada 50 characters likh sakte hain.")
+        elseif status == "active" then
+            ui.loginView.setVisibility(View.GONE) 
+            ui.profileShowView.setVisibility(View.VISIBLE)
+            ui.tvShowName.setText("Name: " .. data.getString("name")) 
+            ui.tvShowLoc.setText("Location: " .. data.getString("location")) 
+            ui.tvShowBio.setText("About: " .. data.getString("bio")) 
+            checkAdminVisibility(data.getString("name"))
+            tts("Loading profile...")
+        end
+    end)
+end
+
+ui.btnProfileSaveStep.onClick = function()
+    local txt = ui.inputProfileData.getText().toString()
+    if txt == "" then tts("Input field is empty.") return end
+    
+    if currentProfileStep == 1 then
+        tts("Naam check kar rahe hain...")
+        isNameTaken(txt, function(taken)
+            if taken then
+                tts("Yeh naam pehle se kisi aur ne le rakha hai. Koi doosra naam likhein.")
+            else
+                tempName = txt 
+                currentProfileStep = 2 
+                ui.tvProfileStepHeader.setText("Step 2: Location") 
+                ui.inputProfileData.setText("") 
+                ui.inputProfileData.setHint("Country, City...") 
+                ui.inputProfileData.setFilters({InputFilter.LengthFilter(100)})
+                tts("Apni location likhein. Aap zyada se zyada 100 characters likh sakte hain.")
+            end
+        end)
+    elseif currentProfileStep == 2 then
+        tempLoc = txt 
+        currentProfileStep = 3 
+        ui.tvProfileStepHeader.setText("Step 3: About You") 
+        ui.inputProfileData.setText("") 
+        ui.inputProfileData.setHint("Apne baare mein...") 
+        ui.inputProfileData.setFilters({InputFilter.LengthFilter(150)})
+        tts("Apne baare mein likhein. Aap zyada se zyada 150 characters likh sakte hain.")
+    elseif currentProfileStep == 3 then
+        tempBio = txt 
+        local payloadObj = JSONObject()
+        payloadObj.put("name", tempName)
+        payloadObj.put("location", tempLoc)
+        payloadObj.put("bio", tempBio)
+        payloadObj.put("lastUpdated", os.time())
+        
+        executeHttp("PUT", base_url_profiles .. android_id .. ".json", payloadObj.toString(), function(c, r)
+            tts("Profile saved successfully.") 
+            currentUsername = tempName
+            ui.profileSetupView.setVisibility(View.GONE) 
+            showLoginView()
+        end)
+    end
+end
+
+ui.btnProfileCancel.onClick = function() 
+    ui.profileSetupView.setVisibility(View.GONE) 
+    showLoginView()
+    tts("Returned to main screen.") 
+end
+
+ui.btnEditProfile.onClick = function() 
+    tts("Checking profile status...")
+    fetchMyProfile(function(status, data)
+        if status ~= "active" then
+            tts("Profile edit abhi possible nahi hai.")
+            return
+        end
+        local lastUpd = data.has("lastUpdated") and data.getInt("lastUpdated") or 0
+        if os.time() - lastUpd < 604800 then
+            tts("Aap apni profile 7 din ke baad hi change kar sakte hain.")
+            return
+        end
+        currentProfileStep = 1 
+        tempName, tempLoc, tempBio = "", "", ""
+        ui.profileShowView.setVisibility(View.GONE) 
+        ui.profileSetupView.setVisibility(View.VISIBLE)
+        ui.tvProfileStepHeader.setText("Step 1: Name") 
+        ui.inputProfileData.setText("") 
+        ui.inputProfileData.setHint("Apna naam likhein...") 
+        ui.inputProfileData.setFilters({InputFilter.LengthFilter(50)})
+        tts("Apna name likhein. Aap zyada se zyada 50 characters likh sakte hain.")
+    end)
+end
+
+-- Delete Profile (7-day pending process)
+ui.btnDeleteProfile.onClick = function()
+    local d = AlertDialog.Builder(service)
+    d.setTitle("Confirm Delete Profile")
+    d.setMessage("Profile delete karne ke baad 7 din tak aap login nahi kar sakenge aur naya profile bhi nahi bana sakenge. 7 din baad profile permanently delete ho jayegi. Kya aap confirm karte hain?")
+    d.setPositiveButton("Confirm", {onClick=function()
+        if not currentProfileData then
+            tts("Profile data load nahi hui. Dobara try karein.")
+            return
+        end
+        local payloadObj = JSONObject()
+        payloadObj.put("name", currentProfileData.getString("name"))
+        payloadObj.put("location", currentProfileData.getString("location"))
+        payloadObj.put("bio", currentProfileData.getString("bio"))
+        payloadObj.put("lastUpdated", currentProfileData.has("lastUpdated") and currentProfileData.getInt("lastUpdated") or os.time())
+        payloadObj.put("pendingDelete", true)
+        payloadObj.put("pendingDeleteTimestamp", os.time())
+        
+        executeHttp("PUT", base_url_profiles .. android_id .. ".json", payloadObj.toString(), function(c, r)
+            tts("Profile delete process shuru ho gaya. 7 din baad permanently delete ho jayegi.")
+            ui.profileShowView.setVisibility(View.GONE)
+            checkAdminVisibility("")
+            showLoginView()
+        end)
+    end})
+    d.setNegativeButton("Cancel", nil)
+    local da = d.create()
+    da.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+    da.show()
+end
+
+ui.btnBackFromProfileView.onClick = function() 
+    ui.profileShowView.setVisibility(View.GONE) 
+    showLoginView()
+    tts("Returned to main screen.") 
+end
+
+ui.btnJoin.onClick = function()
+    tts("Checking profile...")
+    fetchMyProfile(function(status, data)
+        if status == "active" then
+            checkAdminVisibility(data.getString("name"))
+            ui.loginView.setVisibility(View.GONE) 
+            ui.chatView.setVisibility(View.VISIBLE) 
+            isChatActive = true 
+            isFirstLoad = true 
+            startAutoRefresh()
+        elseif status == "pending_delete" then
+            tts("Aapki profile delete process mein hai. Abhi login nahi ho sakta.")
+        elseif status == "blocked" then
+            -- message already spoken
+        else
+            tts("Enter your name first.")
+            ui.btnOpenProfile.performClick()
+        end
+    end)
+end
+
+ui.btnPrivateRoomsList.onClick = function()
+    tts("Opening online users for private chat...")
+    ui.loginView.setVisibility(View.GONE)
+    ui.onlineView.setVisibility(View.VISIBLE)
+    ui.tvOnlineHeader.setText("Loading online users...")
+    
+    executeHttp("GET", db_url_online, nil, function(code, res)
+        if code == "200" and res ~= "null" and res ~= "" then
+            pcall(function()
+                local j = JSONObject(res) 
+                currentOnlineUsersList = {} 
+                local it = j.keys() 
+                local current_time = os.time()
+                while it.hasNext() do 
+                    local rawKey = it.next() 
+                    local userObj = j.getJSONObject(rawKey) 
+                    local lastActive = userObj.has("lastActive") and userObj.getInt("lastActive") or 0
+                    if current_time - lastActive <= 30 and rawKey ~= android_id then 
+                        table.insert(currentOnlineUsersList, rawKey)
+                    end
+                end
+                
+                local loadedNames = {}
+                local countLoaded = 0
+                if #currentOnlineUsersList == 0 then
+                    ui.tvOnlineHeader.setText("No active users found.")
+                    ui.onlineList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String({})))
+                else
+                    for _, u_id in ipairs(currentOnlineUsersList) do
+                        executeHttp("GET", base_url_profiles .. u_id .. "/name.json", nil, function(c2, r2)
+                            countLoaded = countLoaded + 1
+                            if c2 == "200" and r2 ~= "null" and r2 ~= "" then
+                                local cleanName = (r2:gsub('"', ''))
+                                table.insert(loadedNames, cleanName)
+                            end
+                            if countLoaded == #currentOnlineUsersList then
+                                ui.tvOnlineHeader.setText("Select user for Private Chat:") 
+                                ui.onlineList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String(loadedNames)))
+                            end
+                        end)
+                    end
+                end
+            end)
+        else 
+            ui.tvOnlineHeader.setText("No active users found.") 
+            ui.onlineList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String({}))) 
+        end
+    end)
+end
+
+-- ================= ADMIN PANEL =================
+local function showPendingDeletions()
+    executeHttp("GET", db_url_profiles, nil, function(c, r)
+        if c ~= "200" or r == "null" or r == "" then
+            tts("Koi pending deletion nahi hai.")
+            return
+        end
+        local uids = {}
+        local labels = {}
+        pcall(function()
+            local j = JSONObject(r)
+            local it = j.keys()
+            local now = os.time()
+            while it.hasNext() do
+                local uid = it.next()
+                local obj = j.getJSONObject(uid)
+                if obj.has("pendingDelete") and obj.getBoolean("pendingDelete") then
+                    local pts = obj.has("pendingDeleteTimestamp") and obj.getInt("pendingDeleteTimestamp") or 0
+                    local daysLeft = 7 - math.floor((now - pts) / 86400)
+                    if daysLeft < 0 then daysLeft = 0 end
+                    local nm = obj.has("name") and obj.getString("name") or uid
+                    table.insert(uids, uid)
+                    table.insert(labels, nm .. " - " .. daysLeft .. " din baaki")
+                end
+            end
+        end)
+        if #uids == 0 then
+            tts("Koi pending deletion nahi hai.")
+            return
+        end
+        local pd = AlertDialog.Builder(service)
+        pd.setTitle("Pending Deletions")
+        pd.setItems(String(labels), {onClick=function(di, w)
+            local targetUid = uids[w + 1]
+            local sd = AlertDialog.Builder(service)
+            sd.setTitle("Choose Action")
+            sd.setItems(String({"Restore", "Delete Now", "Go Back"}), {onClick=function(di2, w2)
+                if w2 == 0 then
+                    executeHttp("GET", base_url_profiles .. targetUid .. ".json", nil, function(c3, r3)
+                        if c3 == "200" and r3 ~= "null" then
+                            pcall(function()
+                                local oj = JSONObject(r3)
+                                local restored = JSONObject()
+                                restored.put("name", oj.getString("name"))
+                                restored.put("location", oj.getString("location"))
+                                restored.put("bio", oj.getString("bio"))
+                                restored.put("lastUpdated", oj.has("lastUpdated") and oj.getInt("lastUpdated") or os.time())
+                                executeHttp("PUT", base_url_profiles .. targetUid .. ".json", restored.toString(), function()
+                                    tts("Profile restore ho gayi.")
+                                end)
+                            end)
+                        end
+                    end)
+                elseif w2 == 1 then
+                    executeHttp("DELETE", base_url_profiles .. targetUid .. ".json", nil, function()
+                        tts("Profile permanently delete ho gayi.")
+                    end)
+                end
+            end})
+            local sa = sd.create()
+            sa.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            sa.show()
+        end})
+        local pa = pd.create()
+        pa.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+        pa.show()
+    end)
+end
+
+local function showAllRegisteredUsers()
+    executeHttp("GET", db_url_profiles, nil, function(c, r)
+        if c ~= "200" or r == "null" or r == "" then
+            tts("Koi registered user nahi mila.")
+            return
+        end
+        local uids = {}
+        local labels = {}
+        pcall(function()
+            local j = JSONObject(r)
+            local it = j.keys()
+            while it.hasNext() do
+                local uid = it.next()
+                local obj = j.getJSONObject(uid)
+                local nm = obj.has("name") and obj.getString("name") or uid
+                local pending = obj.has("pendingDelete") and obj.getBoolean("pendingDelete")
+                table.insert(uids, uid)
+                if pending then
+                    table.insert(labels, nm .. " (Pending Delete)")
+                else
+                    table.insert(labels, nm)
+                end
+            end
+        end)
+        local ad = AlertDialog.Builder(service)
+        ad.setTitle("All Registered Users - Total: " .. #uids)
+        ad.setItems(String(labels), {onClick=function(di, w)
+            local targetUid = uids[w + 1]
+            local sd = AlertDialog.Builder(service)
+            sd.setTitle("Choose Action")
+            sd.setItems(String({"Force Delete Profile", "Block User", "Unblock User", "Go Back"}), {onClick=function(di2, w2)
+                if w2 == 0 then
+                    executeHttp("DELETE", base_url_profiles .. targetUid .. ".json", nil, function()
+                        tts("Profile force delete ho gayi.")
+                    end)
+                elseif w2 == 1 then
+                    executeHttp("PUT", base_url_blocked .. targetUid .. ".json", "true", function()
+                        tts("User block ho gaya.")
+                    end)
+                elseif w2 == 2 then
+                    executeHttp("DELETE", base_url_blocked .. targetUid .. ".json", nil, function()
+                        tts("User unblock ho gaya.")
+                    end)
+                end
+            end})
+            local sa = sd.create()
+            sa.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            sa.show()
+        end})
+        local aa = ad.create()
+        aa.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+        aa.show()
+    end)
+end
+
+local function clearEntirePublicChat()
+    local cd = AlertDialog.Builder(service)
+    cd.setTitle("Clear Entire Public Chat")
+    cd.setMessage("Yeh poora public chat room SABKE liye permanently clear kar dega. Confirm karein?")
+    cd.setPositiveButton("Confirm", {onClick=function()
+        executeHttp("DELETE", db_url_chat, nil, function(c, r)
+            tts("Poora public chat clear ho gaya.")
+            itemKeys = {}
+            itemValues = {}
+            knownKeys = {}
+            if ui.chatList then
+                ui.chatList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String({})))
+            end
+        end)
+    end})
+    cd.setNegativeButton("Cancel", nil)
+    local ca = cd.create()
+    ca.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+    ca.show()
+end
+
+local function openAdminPanel()
+    local passInput = EditText(service)
+    passInput.setHint("Enter 5-digit Password")
+    passInput.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_TEXT_VARIATION_PASSWORD)
+    passInput.setFilters({InputFilter.LengthFilter(5)})
+    
+    executeHttp("GET", base_url_admin_pass, nil, function(c, r)
+        local correctPass = "11000"
+        if c == "200" and r ~= "null" and r ~= "" then
+            correctPass = r:gsub('"', '')
+        end
+        
+        runOnUiThread(function()
+            local d = AlertDialog.Builder(service)
+            d.setTitle("Admin Panel Security")
+            d.setView(passInput)
+            d.setPositiveButton("Login", {onClick=function()
+                local entered = passInput.getText().toString()
+                if entered == correctPass then
+                    tts("Admin access granted.")
+                    local opts = {"View Blocked Users", "Change Admin Password", "Pending Deletions", "All Registered Users", "Clear Entire Public Chat", "Go Back"}
+                    local ad = AlertDialog.Builder(service)
+                    ad.setTitle("Admin Controls")
+                    ad.setItems(String(opts), {onClick=function(dialog_in, which)
+                        if which == 0 then
+                            executeHttp("GET", base_url_blocked .. ".json", nil, function(bc, br)
+                                if bc == "200" and br ~= "null" and br ~= "" then
+                                    pcall(function()
+                                        local bj = JSONObject(br)
+                                        local names = {}
+                                        local bit = bj.keys()
+                                        while bit.hasNext() do
+                                            local bid = bit.next()
+                                            if bj.getBoolean(bid) then table.insert(names, bid) end
+                                        end
+                                        local bd = AlertDialog.Builder(service)
+                                        bd.setTitle("Blocked Users (tap to unblock)")
+                                        bd.setItems(String(names), {onClick=function(di2, w2)
+                                            local uid = names[w2 + 1]
+                                            executeHttp("DELETE", base_url_blocked .. uid .. ".json", nil, function()
+                                                tts("User unblocked.")
+                                            end)
+                                        end})
+                                        local ba = bd.create()
+                                        ba.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+                                        ba.show()
+                                    end)
+                                else
+                                    tts("No blocked users found.")
+                                end
+                            end)
+                        elseif which == 1 then
+                            local newPassInput = EditText(service)
+                            newPassInput.setHint("Enter new 5-digit password")
+                            newPassInput.setFilters({InputFilter.LengthFilter(5)})
+                            local nd = AlertDialog.Builder(service)
+                            nd.setTitle("Change Password")
+                            nd.setView(newPassInput)
+                            nd.setPositiveButton("Save", {onClick=function()
+                                local newP = newPassInput.getText().toString()
+                                if #newP == 5 then
+                                    executeHttp("PUT", base_url_admin_pass, '"' .. newP .. '"', function(sc, sr)
+                                        tts("New password saved successfully.")
+                                    end)
+                                else
+                                    tts("Password must be 5 digits.")
+                                end
+                            end})
+                            nd.setNegativeButton("Cancel", nil)
+                            local na = nd.create()
+                            na.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+                            na.show()
+                        elseif which == 2 then
+                            showPendingDeletions()
+                        elseif which == 3 then
+                            showAllRegisteredUsers()
+                        elseif which == 4 then
+                            clearEntirePublicChat()
+                        end
+                    end})
+                    local aa = ad.create()
+                    aa.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+                    aa.show()
+                else
+                    tts("Incorrect password.")
+                end
+            end})
+            d.setNegativeButton("Cancel", nil)
+            local alertAdmin = d.create()
+            alertAdmin.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            alertAdmin.show()
+        end)
+    end)
+end
+
+ui.btnAdminPanel.onClick = function()
+    openAdminPanel()
+end
+
+-- Settings menu flow: Settings -> (About & Support / Back)
+ui.btnAbout.onClick = function() 
+    ui.loginView.setVisibility(View.GONE) 
+    ui.settingsMenuView.setVisibility(View.VISIBLE)
+    tts("Settings menu open ho gaya.")
+end
+
+ui.btnGoToAboutSupport.onClick = function()
+    ui.settingsMenuView.setVisibility(View.GONE)
+    ui.aboutView.setVisibility(View.VISIBLE)
+    tts("About and Support khul gaya.")
+end
+
+ui.btnBackSettings.onClick = function()
+    ui.settingsMenuView.setVisibility(View.GONE)
+    showLoginView()
+    tts("Returned to main screen.")
+end
+
+ui.btnCloseApp1.onClick = function() 
+    isChatActive = false
+    isPrivateActive = false
+    stopAnyPlayingAudio() 
+    alert.dismiss() 
+end
+
+ui.btnBackAbout.onClick = function() 
+    ui.aboutView.setVisibility(View.GONE) 
+    ui.settingsMenuView.setVisibility(View.VISIBLE) 
+    tts("Returned to settings menu.")
+end
+
+ui.btnCopyWa.onClick = function() 
+    service.getSystemService(Context.CLIPBOARD_SERVICE).setPrimaryClip(ClipData.newPlainText("WhatsApp", myWhatsAppDisplay)) 
+    tts("Message copied.") 
+end
+
+ui.btnContactWa.onClick = function()
+    local intent = Intent(Intent.ACTION_VIEW) 
+    intent.setData(Uri.parse("https://wa.me/" .. myWhatsAppNumber)) 
+    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) 
+    service.startActivity(intent)
+end
+
+-- Public Chat Send
+ui.btnSend.onClick = function()
+    local textData = ui.inputMessage.getText().toString()
+    if textData == "" then return end
+    
+    local finalSenderName = currentUsername
+    if isAdminName(currentUsername) then
+        finalSenderName = adminName
+    end
+
+    local msgObj = JSONObject()
+    msgObj.put("sender_id", android_id)
+    msgObj.put("sender", finalSenderName)
+    msgObj.put("text", textData)
+    msgObj.put("audioBase64", "")
+    msgObj.put("replyTo", replyingTo)
+    msgObj.put("time", os.date("%I:%M %p"))
+    msgObj.put("timestamp", os.time())
+    
+    executeHttp("POST", db_url_chat, msgObj.toString(), function(code, res)
+        if code == "200" then 
+            tts("Message sent.")
+            ui.inputMessage.setText("") 
+            if replyingTo ~= "" then 
+                replyingTo = "" 
+                ui.replyText.setVisibility(View.GONE) 
+            end 
+            loadMessages() 
+        else
+            tts("Network error. Failed to send.")
+        end
+    end)
+end
+
+-- Private Chat Send
+ui.btnPrivateSend.onClick = function()
+    local textData = ui.inputPrivateMessage.getText().toString()
+    if textData == "" then return end
+    
+    local finalSenderName = currentUsername
+    if isAdminName(currentUsername) then
+        finalSenderName = adminName
+    end
+
+    local msgObj = JSONObject()
+    msgObj.put("sender_id", android_id)
+    msgObj.put("sender", finalSenderName)
+    msgObj.put("text", textData)
+    msgObj.put("time", os.date("%I:%M %p"))
+    msgObj.put("timestamp", os.time())
+    
+    local chatRoomKey = getPrivateChatKey(android_id, currentChatPartnerID)
+    local private_url = base_url_private .. chatRoomKey .. ".json"
+    
+    executeHttp("POST", private_url, msgObj.toString(), function(code, res)
+        if code == "200" then
+            tts("Private message sent.")
+            ui.inputPrivateMessage.setText("")
+            loadPrivateMessages()
+        else
+            tts("Failed to send private message.")
+        end
+    end)
+end
+
+-- Private Clear with Confirm/Cancel
+ui.btnPrivateClear.onClick = function()
+    local cd = AlertDialog.Builder(service)
+    cd.setTitle("Clear Chat")
+    cd.setMessage("Yeh chat sirf aapki taraf se clear hogi. Confirm karein?")
+    cd.setPositiveButton("Confirm", {onClick=function()
+        if #privateItemKeys > 0 then
+            currentPrivateClearedKey = privateItemKeys[#privateItemKeys]
+            local chatRoomKey = getPrivateChatKey(android_id, currentChatPartnerID)
+            savePrivateClearedKey(chatRoomKey, currentPrivateClearedKey)
+        end
+        privateItemKeys = {}
+        privateItemValues = {}
+        ui.privateChatList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String(privateItemValues)))
+        tts("Chat clear ho gayi.")
+    end})
+    cd.setNegativeButton("Cancel", nil)
+    local ca = cd.create()
+    ca.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+    ca.show()
+end
+
+ui.btnPrivateBack.onClick = function()
+    isPrivateActive = false
+    ui.privateChatView.setVisibility(View.GONE)
+    showLoginView()
+    tts("Returned to main screen.")
+end
+
+ui.btnMore.onClick = function() 
+    ui.chatView.setVisibility(View.GONE) 
+    ui.moreMenuView.setVisibility(View.VISIBLE) 
+    tts("More options menu open ho gaya.")
+end
+
+ui.btnBack.onClick = function() 
+    isChatActive = false 
+    stopAnyPlayingAudio() 
+    ui.chatView.setVisibility(View.GONE) 
+    showLoginView()
+    tts("Returned to main screen.") 
+end
+
+-- ================= AUDIO RECORDING =================
+local function stopRecordingInternal()
+    pcall(function()
+        mediaRecorder.stop() 
+        mediaRecorder.release() 
+        mediaRecorder = nil 
+    end)
+    isRecording = false
+    ui.btnMic.setText("Mic") 
+    ui.normalChatBar.setVisibility(View.GONE) 
+    ui.audioPreviewBar.setVisibility(View.VISIBLE)
+    tts("Recording khatam ho gayi. Ab sun rahe hain.")
+    
+    stopAnyPlayingAudio()
+    pcall(function()
+        chatPlayer = luajava.newInstance("android.media.MediaPlayer") 
+        chatPlayer.setDataSource(audio_record_file) 
+        chatPlayer.prepare() 
+        chatPlayer.start() 
+    end)
+end
+
+ui.btnMic.onClick = function()
+    checkVoiceLimitFirebase(function(currentCount)
+        if currentCount >= 10 then
+            tts("Daily voice limit reached. Try again tomorrow.")
+            return
+        end
+
+        if not isRecording then
+            local ok, err = pcall(function()
+                if mediaRecorder then mediaRecorder.release() end
+                mediaRecorder = luajava.newInstance("android.media.MediaRecorder")
+                mediaRecorder.setAudioSource(1) 
+                mediaRecorder.setOutputFormat(2) 
+                mediaRecorder.setAudioEncoder(3)
+                mediaRecorder.setAudioEncodingBitRate(128000) 
+                mediaRecorder.setAudioSamplingRate(44100) 
+                mediaRecorder.setMaxDuration(20000)
+                mediaRecorder.setOutputFile(audio_record_file)
+                mediaRecorder.prepare()
+                mediaRecorder.start()
+                isRecording = true
+                ui.btnMic.setText("Stop")
+                tts("Voice recording start hui. Max 20 second.")
+                
+                recordLimitRunnable = Runnable{run=function()
+                    if isRecording then stopRecordingInternal() end
+                end}
+                ui_handler.postDelayed(recordLimitRunnable, 20000)
+            end)
+        else
+            if recordLimitRunnable then
+                ui_handler.removeCallbacks(recordLimitRunnable)
+                recordLimitRunnable = nil
+            end
+            stopRecordingInternal()
+        end
+    end)
+end
+
+ui.btnPlayPreview.onClick = function()
+    stopAnyPlayingAudio()
+    pcall(function()
+        chatPlayer = luajava.newInstance("android.media.MediaPlayer") 
+        chatPlayer.setDataSource(audio_record_file) 
+        chatPlayer.prepare() 
+        chatPlayer.start() 
+        tts("Message play ho gaya.")
+    end)
+end
+
+ui.btnCancelAudio.onClick = function()
+    stopAnyPlayingAudio() 
+    File(audio_record_file).delete() 
+    ui.audioPreviewBar.setVisibility(View.GONE) 
+    ui.normalChatBar.setVisibility(View.VISIBLE) 
+    tts("Voice message discarded.")
+end
+
+ui.btnSendAudio.onClick = function()
+    stopAnyPlayingAudio() 
+    ui.btnSendAudio.setText("Sending...") 
+    ui.btnSendAudio.setEnabled(false) 
+    ui.btnCancelAudio.setEnabled(false) 
+    ui.btnPlayPreview.setEnabled(false)
+    
+    local b64Audio = encodeFileToBase64(audio_record_file)
+    if b64Audio ~= "" then
+        checkVoiceLimitFirebase(function(currentCount)
+            if currentCount >= 10 then
+                ui.btnSendAudio.setText("Send") 
+                ui.btnSendAudio.setEnabled(true) 
+                ui.btnCancelAudio.setEnabled(true) 
+                ui.btnPlayPreview.setEnabled(true)
+                tts("Daily voice limit reached.")
+                return
+            end
+            
+            local finalSenderName = currentUsername
+            if isAdminName(currentUsername) then finalSenderName = adminName end
+
+            local msgObj = JSONObject()
+            msgObj.put("sender_id", android_id)
+            msgObj.put("sender", finalSenderName)
+            msgObj.put("text", "[Voice Message]")
+            msgObj.put("audioBase64", b64Audio)
+            msgObj.put("replyTo", replyingTo)
+            msgObj.put("time", os.date("%I:%M %p"))
+            msgObj.put("timestamp", os.time())
+            
+            executeHttp("POST", db_url_chat, msgObj.toString(), function(c, r)
+                ui.btnSendAudio.setText("Send") 
+                ui.btnSendAudio.setEnabled(true) 
+                ui.btnCancelAudio.setEnabled(true) 
+                ui.btnPlayPreview.setEnabled(true)
+                
+                if c == "200" then 
+                    incrementVoiceLimitFirebase(currentCount, function()
+                        tts("Voice message sent.") 
+                        ui.audioPreviewBar.setVisibility(View.GONE) 
+                        ui.normalChatBar.setVisibility(View.VISIBLE) 
+                        File(audio_record_file).delete() 
+                        if replyingTo ~= "" then 
+                            replyingTo = "" 
+                            ui.replyText.setVisibility(View.GONE) 
+                        end 
+                        loadMessages()
+                    end)
+                else 
+                    tts("Network error. Failed to send.") 
+                end
+            end)
+        end)
+    else
+        ui.btnSendAudio.setText("Send") 
+        ui.btnSendAudio.setEnabled(true) 
+        ui.btnCancelAudio.setEnabled(true) 
+        ui.btnPlayPreview.setEnabled(true)
+    end
+end
+
+ui.btnBackFromMore.onClick = function() 
+    ui.moreMenuView.setVisibility(View.GONE) 
+    ui.chatView.setVisibility(View.VISIBLE) 
+end
+
+ui.btnMute.onClick = function() 
+    ttsMuted = not ttsMuted 
+    if ttsMuted then 
+        ui.btnMute.setText("Unmute TTS")
+        service.speak("Text to speech muted.") 
+    else 
+        ui.btnMute.setText("Mute TTS") 
+        service.speak("Text to speech enabled.") 
+    end 
+end
+
+-- Clear Chat with Confirm/Cancel
+ui.btnClear.onClick = function()
+    local cd = AlertDialog.Builder(service)
+    cd.setTitle("Clear Chat")
+    cd.setMessage("Yeh chat sirf aapki taraf se clear hogi. Confirm karein?")
+    cd.setPositiveButton("Confirm", {onClick=function()
+        if #itemKeys > 0 then 
+            lastClearedKey = itemKeys[#itemKeys] 
+            saveClearedKey(lastClearedKey) 
+        end 
+        itemKeys = {}
+        itemValues = {}
+        ui.chatList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String(itemValues))) 
+        tts("All chat cleared.") 
+        ui.moreMenuView.setVisibility(View.GONE) 
+        ui.chatView.setVisibility(View.VISIBLE)
+    end})
+    cd.setNegativeButton("Cancel", nil)
+    local ca = cd.create()
+    ca.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+    ca.show()
+end
+
+ui.btnOnline.onClick = function()
+    ui.moreMenuView.setVisibility(View.GONE) 
+    ui.onlineView.setVisibility(View.VISIBLE) 
+    ui.tvOnlineHeader.setText("Loading...")
+    tts("Online users list open ho gayi.")
+    
+    executeHttp("GET", db_url_online, nil, function(code, res)
+        if code == "200" and res ~= "null" and res ~= "" then
+            pcall(function()
+                local j = JSONObject(res) 
+                currentOnlineUsersList = {} 
+                local it = j.keys() 
+                local current_time = os.time()
+                while it.hasNext() do 
+                    local rawKey = it.next() 
+                    local userObj = j.getJSONObject(rawKey) 
+                    local lastActive = userObj.has("lastActive") and userObj.getInt("lastActive") or 0
+                    if current_time - lastActive <= 30 then 
+                        table.insert(currentOnlineUsersList, rawKey)
+                    end
+                end
+                
+                local loadedNames = {}
+                local countLoaded = 0
+                if #currentOnlineUsersList == 0 then
+                    ui.tvOnlineHeader.setText("Total Online Users: 0")
+                    ui.onlineList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String({})))
+                else
+                    for _, u_id in ipairs(currentOnlineUsersList) do
+                        executeHttp("GET", base_url_profiles .. u_id .. "/name.json", nil, function(c2, r2)
+                            countLoaded = countLoaded + 1
+                            if c2 == "200" and r2 ~= "null" and r2 ~= "" then
+                                local cleanName = (r2:gsub('"', ''))
+                                table.insert(loadedNames, cleanName)
+                            end
+                            if countLoaded == #currentOnlineUsersList then
+                                ui.tvOnlineHeader.setText("Total Online Users: " .. #loadedNames) 
+                                ui.onlineList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String(loadedNames)))
+                            end
+                        end)
+                    end
+                end
+            end)
+        else 
+            ui.tvOnlineHeader.setText("Total Online Users: 0") 
+            ui.onlineList.setAdapter(ArrayAdapter(service, android.R.layout.simple_list_item_1, String({}))) 
+        end
+    end)
+end
+
+ui.btnBackOnline.onClick = function() 
+    ui.onlineView.setVisibility(View.GONE) 
+    showLoginView()
+    tts("Returned to main screen.")
+end
+
+-- Online User Selection & Profile View
+ui.onlineList.onItemClick = function(parent, viewList, position, id)
+    local safeKey = currentOnlineUsersList[position + 1] 
+    if not safeKey then return true end 
+    currentChatPartnerID = safeKey
+    tts("Loading profile...")
+    
+    executeHttp("GET", base_url_profiles .. safeKey .. ".json", nil, function(code, res)
+        if code == "200" and res ~= "null" and res ~= "" then
+            pcall(function()
+                local j = JSONObject(res) 
+                currentChatPartnerName = j.getString("name")
+                ui.otherProfileView.setVisibility(View.VISIBLE)
+                ui.onlineView.setVisibility(View.GONE) 
+                ui.tvOtherName.setText("Name: " .. currentChatPartnerName) 
+                ui.tvOtherLoc.setText("Location: " .. j.getString("location")) 
+                ui.tvOtherBio.setText("About: " .. j.getString("bio"))
+                
+                if isAdminName(currentUsername) then
+                    ui.btnBlockUser.setVisibility(View.VISIBLE)
+                else
+                    ui.btnBlockUser.setVisibility(View.GONE)
+                end
+            end)
+        else 
+            tts("User profile not found.") 
+        end
+    end)
+    return true
+end
+
+-- Open Private Chat from Profile
+ui.btnStartPrivateChat.onClick = function()
+    ui.otherProfileView.setVisibility(View.GONE)
+    ui.privateChatView.setVisibility(View.VISIBLE)
+    
+    local chatRoomKey = getPrivateChatKey(android_id, currentChatPartnerID)
+    currentPrivateClearedKey = getPrivateClearedKey(chatRoomKey)
+    isPrivateFirstLoad = true
+    isPrivateActive = true
+    
+    loadPrivateMessages()
+    startPrivateAutoRefresh()
+end
+
+-- Admin Block User from Profile
+ui.btnBlockUser.onClick = function()
+    executeHttp("PUT", base_url_blocked .. currentChatPartnerID .. ".json", "true", function(c, r)
+        if c == "200" then
+            tts("User blocked successfully.")
+        else
+            tts("Failed to block user.")
+        end
+    end)
+end
+
+ui.btnBackFromOtherProfile.onClick = function() 
+    ui.otherProfileView.setVisibility(View.GONE) 
+    ui.onlineView.setVisibility(View.VISIBLE) 
+end
+
+ui.chatList.onItemClick = function(parent, viewList, position, id)
+    local selectedKey = itemKeys[position + 1] 
+    local rawMsg = rawMessages[selectedKey] 
+    if not rawMsg then return true end
+    
+    local d = AlertDialog.Builder(service) 
+    d.setTitle("Options")
+    
+    local opts = {}
+    if rawMsg.audioBase64 ~= "" then 
+        table.insert(opts, "Play Audio") 
+        table.insert(opts, "Stop Audio") 
+    end
+    table.insert(opts, "Reply") 
+    
+    if rawMsg.audioBase64 == "" then 
+        table.insert(opts, "Copy") 
+    end
+    
+    if rawMsg.sender_id == android_id or isAdminName(currentUsername) then 
+        table.insert(opts, "Delete (Unsend)") 
+    end
+    
+    table.insert(opts, "Go Back")
+    
+    d.setItems(String(opts), {onClick=function(d_inter, which)
+        local choice = opts[which + 1]
+        
+        if choice == "Play Audio" then
+            stopAnyPlayingAudio() 
+            pcall(function() 
+                local bytes = Base64.decode(rawMsg.audioBase64, Base64.NO_WRAP)
+                local fos = FileOutputStream(audio_play_file)
+                fos.write(bytes)
+                fos.flush()
+                fos.close()
+                
+                chatPlayer = luajava.newInstance("android.media.MediaPlayer") 
+                chatPlayer.setDataSource(audio_play_file) 
+                chatPlayer.prepareAsync()
+                local mpListener = luajava.createProxy("android.media.MediaPlayer$OnPreparedListener", { 
+                    onPrepared = function(mp) 
+                        mp.start() 
+                        tts("Message play ho gaya.") 
+                    end 
+                })
+                chatPlayer.setOnPreparedListener(mpListener) 
+            end)
+            
+        elseif choice == "Stop Audio" then 
+            stopAnyPlayingAudio() 
+            tts("Audio stopped.")
+            
+        elseif choice == "Copy" then 
+            service.getSystemService(Context.CLIPBOARD_SERVICE).setPrimaryClip(ClipData.newPlainText("chat", rawMsg.text)) 
+            tts("Message copied.")
+            
+        elseif choice == "Reply" then 
+            replyingTo = rawMsg.senderName 
+            ui.replyText.setText("Replying to: " .. replyingTo .. " (Tap to cancel)") 
+            ui.replyText.setVisibility(View.VISIBLE) 
+            tts("Replying to " .. replyingTo)
+            
+        elseif choice == "Delete (Unsend)" then 
+            local dd = AlertDialog.Builder(service)
+            dd.setTitle("Confirm Delete")
+            dd.setMessage("Kya aap sach mein is message ko permanently delete karna chahte hain?")
+            dd.setPositiveButton("Delete", {onClick=function()
+                executeHttp("DELETE", base_url_chat .. selectedKey .. ".json", nil, function(c, r) 
+                    if c == "200" then 
+                        tts("Message deleted.") 
+                        loadMessages() 
+                    end 
+                end) 
+            end})
+            dd.setNegativeButton("Cancel", nil)
+            local ddAlert = dd.create()
+            ddAlert.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY)
+            ddAlert.show()
+            
+        elseif choice == "Go Back" then
+            tts("Action cancelled.")
+        end
+    end})
+    
+    local alertOpt = d.create() 
+    alertOpt.getWindow().setType(WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY) 
+    alertOpt.show()
+    return true
+end
+
+ui.replyText.onClick = function() 
+    replyingTo = "" 
+    ui.replyText.setVisibility(View.GONE) 
+    tts("Reply cancelled.") 
+end
